@@ -19,6 +19,10 @@ func (e *Engine) trigger(ctx context.Context, taskID string) error {
 	case e.events <- ev:
 	case <-e.stop:
 		return ErrEngineNotRunning
+	case <-e.shutdown:
+		// Drain already requested but the scheduler may not have consumed it
+		// yet; a trigger arriving in that window must not start anything.
+		return ErrEngineNotRunning
 	case <-ctx.Done():
 		return ctx.Err()
 	}

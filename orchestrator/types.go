@@ -125,4 +125,12 @@ type Snapshot struct {
 	// snapshots with a non-monotonic version are rejected.
 	Version int                   `json:"version"`
 	Tasks   map[string]*TaskState `json:"tasks"`
+	// PlanHash is the SHA-256 fingerprint of the exact task definitions this
+	// state was produced under. On restart, New refuses to resume when the
+	// fingerprint of the current definitions differs (see PlanMismatchError).
+	PlanHash string `json:"plan_hash,omitempty"`
+	// Plan is the canonical (sorted, normalized) task set the hash was taken
+	// over. It is stored alongside the hash so a rejection can explain exactly
+	// which task / field changed. It is diagnostic input, never execution input.
+	Plan []TaskDef `json:"plan,omitempty"`
 }

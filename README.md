@@ -15,6 +15,14 @@
   回退提交与自相矛盾的快照被显式拒绝。
 - 中断恢复：崩溃时在跑的任务有明确稳定的归宿（关闭为 `interrupted`，有
   预算则立即重投，否则确定性失败）；已完成任务重启后绝不重复执行。
+- 优雅停机：`Shutdown` 后不再派发任何新任务（含重试），在途尝试要么跑完并
+  正常提交，要么在宽限期结束后被取消并以 `interrupted` 关闭；停机前已排定
+  的待办（pending、retry_wait 的绝对重试时刻）原样保留并可续跑。
+- 重试等待跨重启：等待窗口以**绝对时间点 `NextRunAt`** 落盘，重启后按原时刻
+  重新挂表——已过点立即续跑，没到点继续等剩余时间，反复重启不会重新计时。
+- 计划一致性：快照带任务定义的 SHA-256 指纹；启动时定义（任务增删、依赖、
+  超时、重试策略）与落盘时不一致会被**明确拒绝**（`PlanMismatchError`），
+  与"状态本身损坏/回退"的 `ValidationError(invalid_persisted_state)` 分开。
 - 时间全部抽象在 `Clock` 接口后：测试用 `FakeClock` 推进计时器，**不依赖
   任何真实等待**。
 
@@ -25,7 +33,9 @@ go run ./cmd/demo
 ```
 
 demo 会构建一个菱形 DAG（`build -> {lint,test} -> package`），其中 `build`
-前两次失败、第三次成功，随后模拟"进程重启"从同一状态文件恢复。
+前两次失败、第三次成功。它先在第一次运行中途发起优雅停机（把 build 停在
+retry_wait），随后从同一状态文件重启续跑，最后再用一份被改过的计划启动并
+展示 `PlanMismatchError` 拒绝。
 
 ## 核心抽象
 
@@ -125,6 +135,70 @@ type Store interface {
 `Attempt` 是只追加的审计证据：序号连续、从 1 开始、不可改写；`running`
 状态只允许最后一条尝试是"开放"的（无结束时间、无类别）。
 
+## 优雅停机与重启续跑
+
+停机有两条入口，归宿不同但状态都明确、稳定：
+
+| 停机方式 | 在跑尝试的处理 | 重启归宿 |
+| --- | --- | --- |
+| `Shutdown(ctx)`（优雅停机） | 立即进入 drain：不派发任何新任务（含退避到期的重试）；在途尝试继续跑，在 `ctx` 宽限期内跑完的结果**正常提交**（成功/失败/重试等待都落盘）；宽限期结束仍未返回的尝试被取消 context，以 `interrupted` 关闭 | 与崩溃恢复同一套规则 |
+| `Run` 的 context 被取消 / 进程崩溃 | 不提交在途结果，任务保留为带开放尝试的 `running` | 启动时以 `interrupted` 关闭后按预算续跑或终止失败 |
+
+`Shutdown` 的细节：
+
+- 返回前 drain 期间产生的每个状态都已 `Commit` 落盘，所以停机后的快照里
+  **不存在任何模糊状态**（不会留下"running 但进程已停"之外需要猜测的东西；
+  强制取消的尝试也已关闭并落盘）；`Run` 随后返回 `ErrGracefulShutdown`。
+- 停机期间 `Trigger` 一律返回 `ErrEngineNotRunning`，已挂起的 Trigger 同样
+  被唤醒并得到该错误，不会借停机窗口派发任务。
+- 停机前已经排定的事不会丢：尚未开始的任务保持 `pending`（其依赖关系还在
+  快照里）；已进入 `retry_wait` 的任务保留**原来的绝对重试时刻**；下游任务
+  在续跑后照常被调度。
+- `Shutdown` 在 `Run` 之前调用是空操作；宽限期到期本身不会让 `Shutdown` 返回
+  错误——它只触发强制取消，随后等待这些调和全部持久化（执行器应在 context
+  取消后尽快返回）。
+
+### 重试等待窗口跨重启的规则
+
+任务进入 `retry_wait` 时，状态里存的是**绝对时间点** `NextRunAt = 失败提交时刻 + 退避时长`，而不是"还要等多久"。下次启动：
+
+1. `NextRunAt` 已早于当前时间 → 立即具备运行资格，首次调度扫描即派发，不会
+   再补等；
+2. `NextRunAt` 仍在未来 → 按 `NextRunAt - now` 的**剩余时长**重新挂表，等到
+   的是最初排定的那个时刻；
+3. 因此无论中途重启多少次，总等待时长都等于策略算出的原始退避，不会被每次
+   重启重新计时而无限拉长；
+4. 被 `Shutdown` 强制取消（`interrupted`）的尝试同样进入 `retry_wait`，
+   `NextRunAt` 取停机提交时刻（即重启后立即可跑，等同于崩溃后的 at-least-once
+   投递）。
+
+## 计划一致性（指纹校验）
+
+每次初始化的快照都带：
+
+- `plan_hash`：规范化任务定义的 SHA-256（hex）。参与指纹的字段是
+  **ID、依赖集合、单次超时、重试策略**（最大尝试次数、初始退避、退避上限）；
+  任务声明顺序、依赖列出顺序不影响指纹（规范化时排序），重试策略按
+  `New` 中的同一规则归一化。
+- `plan`：参与哈希的规范化任务副本，仅用于在拒绝时**逐条列出差异**。
+
+重启 `New` 的判定顺序：
+
+1. 快照没有指纹（指纹特性上线前的旧快照）→ 拒绝，`PlanMismatchError`，
+   原因是"无法证明计划一致"；
+2. 指纹与当前定义一致 → 放行（即使是停机/崩溃留下的中间状态，也先恢复再跑）；
+3. 指纹不一致 → 拒绝，`PlanMismatchError`，错误中给出新旧两个哈希，并逐任务
+   说明：任务新增、任务删除、依赖变更、超时变更、重试次数/初始退避/退避上限
+   变更。
+
+这与**状态损坏**严格区分：
+
+| 失败 | 类型 | 含义 |
+| --- | --- | --- |
+| 定义与落盘计划不一致 | `*PlanMismatchError`（字符串原因 `plan_mismatch`） | 状态本身完好，但不是这份定义跑出来的，拒绝用旧进度硬跑 |
+| 快照自相矛盾 / 字段非法 / 状态回退 | `*ValidationError`，`Reason=invalid_persisted_state` | 状态本身损坏，与计划是否变化无关 |
+| Store 收到不高于已落盘版本的提交 | 内部版本回退错误（`Commit` 直接拒绝） | 防止任何形式的状态回退 |
+
 ## 持久化与恢复规则
 
 - 每次调度决策（派发、尝试结束、恢复调和）都会：状态版本号 +1 → 全量
@@ -138,9 +212,10 @@ type Store interface {
   2. 若尝试预算未用尽 → `retry_wait`，`NextRunAt=恢复时刻`（立即具备
      再次运行资格，即 at-least-once 投递）；
   3. 若预算已用尽 → 终止 `failed`，终止原因就是这次中断。
-- `Run` 的 context 被取消（正常停机）与进程崩溃**同等对待**：一旦停机，
+- `Run` 的 context 被取消（非优雅停机）与进程崩溃**同等对待**：一旦停机，
   调度器不再提交任何在途尝试结果，在跑任务保留为带开放尝试的 `running`
   状态，下次启动仍由上述恢复规则决定归宿；尚未开始的任务保持 `pending`。
+  需要"停机即交代清楚"时应使用 `Shutdown`（见上一节）。
 - 已 `succeeded` / `failed` 的任务在重启后原样保留，**永不重新执行**；
   无运行中任务时恢复过程是无副作用的 no-op，版本号不前进。
 
@@ -193,6 +268,19 @@ go run ./cmd/demo
 | 崩溃在跑 → interrupted 后重试成功 | `TestRecoverRunningTaskRetries` |
 | 崩溃在最后一次尝试 → 确定性失败 | `TestRecoverRunningTaskBudgetExhausted` |
 | 已完成任务重启不重跑、版本不前进 | `TestRecoverCompletedTaskNotRerun` |
+| 优雅停机：在途成功提交、未派发任务保持 pending、重启只跑一次 | `TestGracefulShutdownWaitsForInFlight` |
+| 优雅停机宽限期到期：强制取消以 interrupted 落盘为 retry_wait，重启重放一次 | `TestGracefulShutdownForcesAfterDeadline` |
+| 强制停机耗尽最后预算 → 确定性失败 | `TestGracefulShutdownForceExhaustsBudget` |
+| 停机中 Trigger 被拒、挂起 Trigger 被释放 | `TestTriggersRejectedDuringDrain` |
+| Run 之前 Shutdown 为空操作 | `TestShutdownWhenNothingInFlight` |
+| 重试等待中停机、在原时刻之前重启继续等剩余时间、下游不丢 | `TestRetryWaitSurvivesRestartBeforeDeadline` |
+| 重启时退避已过点 → 立即续跑 | `TestRetryWaitElapsedBeforeRestartDispatchesImmediately` |
+| 连续两次重启不重新计时、总等待不被拉长 | `TestRepeatedRestartsDoNotResetRetryWait` |
+| drain 中在途尝试失败 → retry_wait 绝对时刻落盘并续跑 | `TestAttemptFailingDuringDrainCommitsRetryWait` |
+| 任务增删 / 依赖 / 超时 / 重试策略变更被拒绝 | `TestRestartRejectsChangedPlan` |
+| 计划不一致与状态损坏错误类型可区分 | `TestPlanMismatchDistinctFromCorruptState` |
+| 声明顺序不同的等价计划正常续跑 | `TestSamePlanResumes` |
+| 拒绝信息精确到任务与字段；无指纹旧快照被拒 | `TestMismatchDetailsAreSpecific` / `TestLegacySnapshotWithoutFingerprintRejected` |
 | 篡改 / 回退快照被拒绝 | `TestCorruptOrRolledBackSnapshotRejected` |
 | Store 版本回退提交被拒绝 | `TestStoreRejectsVersionRollback` |
 | 磁盘 JSON 落盘与重启续跑 | `TestFileStoreRoundTrip` |
@@ -202,16 +290,18 @@ go run ./cmd/demo
 
 ```
 orchestrator/
-  types.go      状态、尝试、重试策略等领域类型
-  errors.go     可区分原因的校验错误
+  types.go      状态、尝试、重试策略、快照计划指纹字段
+  errors.go     可区分原因的校验错误、ErrGracefulShutdown
   dags.go       执行前 DAG 校验（重复/未知依赖/环）
+  plan.go       计划规范化、SHA-256 指纹、变更差异列举、一致性裁决
   clock.go      Clock 抽象、系统时钟、可推进的 FakeClock
   state.go      状态机白名单与快照一致性校验
   store.go      Store 接口、FileStore（原子写）、MemoryStore
-  recovery.go   重启时的 in-flight 调和
-  engine.go     Engine、New、读取 API
-  runloop.go    单调度器事件循环与全部状态迁移
-  execute.go    单次尝试执行、超时、依赖判定
+  recovery.go   重启时的 in-flight 调和、retry_wait 计时器重建
+  shutdown.go   Shutdown 优雅停机与 drain 状态统计
+  engine.go     Engine、New 中的指纹写入/校验、读取 API
+  runloop.go    单调度器事件循环、drain 闸门、全部状态迁移
+  execute.go    单次尝试执行、超时、强制取消、依赖判定
   trigger.go    显式触发 API
-cmd/demo/       端到端示例
+cmd/demo/       端到端示例（优雅停机 → 重启续跑 → 计划变更被拒）
 ```

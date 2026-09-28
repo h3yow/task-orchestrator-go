@@ -46,6 +46,10 @@ type event struct {
 	seq    int
 	at     time.Time // evRetryDue
 	reply  chan error
+	// forced marks an evAttemptDone whose executor context was cancelled by a
+	// forced drain; the attempt is closed as AttemptInterrupted regardless of
+	// the result the executor returned.
+	forced bool
 }
 
 // Engine drives scheduling, retries, timeouts and restart recovery.
@@ -74,7 +78,16 @@ type Engine struct {
 	stop    chan struct{}
 	sem     chan struct{}
 
-	runStarted atomic.Bool
+	// shutdown / drain state. closing shutdown requests a graceful drain
+	// (exactly once); closing forceDrain cancels the contexts of attempts that
+	// are still in flight when the shutdown grace period expires.
+	shutdown         chan struct{}
+	forceDrain       chan struct{}
+	draining         bool
+	forceDrainClosed bool
+
+	runStarted    atomic.Bool
+	shutdownStart atomic.Bool
 
 	// execCtx / execCancel control all in-flight executor attempts and are
 	// wired to the context passed to Run.
@@ -121,19 +134,29 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 		order = append(order, d.ID)
 	}
 
+	// The canonical plan and its fingerprint bind this engine instance to one
+	// exact task definition. Snapshots store both; resumes under a different
+	// plan are rejected with PlanMismatchError.
+	plan := canonicalPlan(order, index)
+	planHash, err := planFingerprint(plan)
+	if err != nil {
+		return nil, err
+	}
 	e := &Engine{
-		order:    order,
-		defs:     index,
-		store:    opt.Store,
-		executor: opt.Executor,
-		clock:    clock,
-		log:      opt.Logger,
-		maxConc:  maxConc,
-		events:   make(chan event, 256),
-		settled:  make(chan struct{}),
-		stop:     make(chan struct{}),
-		sem:      make(chan struct{}, maxConc),
-		waiters:  make(map[string][]chan error),
+		order:      order,
+		defs:       index,
+		store:      opt.Store,
+		executor:   opt.Executor,
+		clock:      clock,
+		log:        opt.Logger,
+		maxConc:    maxConc,
+		events:     make(chan event, 256),
+		settled:    make(chan struct{}),
+		stop:       make(chan struct{}),
+		shutdown:   make(chan struct{}),
+		forceDrain: make(chan struct{}),
+		sem:        make(chan struct{}, maxConc),
+		waiters:    make(map[string][]chan error),
 	}
 
 	loaded, err := opt.Store.Load()
@@ -144,7 +167,12 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 		// First ever start: every task is pending. Committing version 0 makes
 		// the initial state itself durable and auditable.
 		now := clock.Now()
-		snap := &Snapshot{Version: 0, Tasks: make(map[string]*TaskState, len(order))}
+		snap := &Snapshot{
+			Version:  0,
+			Tasks:    make(map[string]*TaskState, len(order)),
+			PlanHash: planHash,
+			Plan:     append([]TaskDef(nil), plan...),
+		}
 		for _, id := range order {
 			snap.Tasks[id] = newInitialState(now)
 		}
@@ -155,12 +183,19 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 			return nil, err
 		}
 		loaded = snap
-		e.decide("initialized fresh state with %d pending tasks at version %d", len(order), loaded.Version)
+		e.decide("initialized fresh state with %d pending tasks at version %d (plan hash %s)", len(order), loaded.Version, shortHash(planHash))
 	} else {
+		// Plan identity is judged before internal state validation: a snapshot
+		// produced under other definitions is a PlanMismatchError, while a
+		// self-contradictory snapshot under the SAME plan is
+		// ReasonInvalidState. The two failure classes never get conflated.
+		if err := verifyPlanMatch(loaded, plan, planHash); err != nil {
+			return nil, err
+		}
 		if err := validateSnapshot(loaded, index); err != nil {
 			return nil, err
 		}
-		e.decide("loaded persisted state at version %d with %d tasks", loaded.Version, len(loaded.Tasks))
+		e.decide("loaded persisted state at version %d with %d tasks (plan hash %s verified)", loaded.Version, len(loaded.Tasks), shortHash(planHash))
 	}
 	e.snap = loaded
 
@@ -211,7 +246,10 @@ func (e *Engine) State(taskID string) (TaskState, error) {
 func (e *Engine) Snapshot() Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	cp := Snapshot{Version: e.snap.Version, Tasks: make(map[string]*TaskState, len(e.snap.Tasks))}
+	cp := Snapshot{Version: e.snap.Version, Tasks: make(map[string]*TaskState, len(e.snap.Tasks)), PlanHash: e.snap.PlanHash}
+	if e.snap.Plan != nil {
+		cp.Plan = append([]TaskDef(nil), e.snap.Plan...)
+	}
 	for id, st := range e.snap.Tasks {
 		c := *st
 		if st.Attempts != nil {

@@ -24,6 +24,7 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	// Initial scheduling pass.
 	e.mu.Lock()
 	e.scheduleAll("initial scheduling")
+	e.armPersistedRetryWaits()
 	e.mu.Unlock()
 
 	for {
@@ -38,10 +39,39 @@ func (e *Engine) runLoop(ctx context.Context) error {
 		}
 
 		ctxCh := ctx.Done()
+		// A closed channel stays readable forever: once a drain signal has been
+		// consumed, nil its select case so the loop goes back to waiting for
+		// attempt events instead of spinning on the closed channel.
+		shutdownCh := e.shutdown
+		if e.draining {
+			shutdownCh = nil
+		}
+		forceCh := e.forceDrain
+		if e.forceDrainClosed {
+			forceCh = nil
+		}
 		select {
 		case <-ctxCh:
 			e.decide("scheduler cancelled by context: %v", ctx.Err())
 			return ctx.Err()
+		case <-shutdownCh:
+			e.beginDrain()
+			// A drain request may arrive when nothing is in flight (every task
+			// was already terminal or pending-with-blocked-deps is impossible
+			// here since terminal is handled above; but parked waiters and a
+			// zero-semaphore state must still be reconciled).
+			e.mu.Lock()
+			e.scheduleAll("shutdown scheduling (no new dispatches)")
+			if e.drainComplete() {
+				err := e.finishDrain()
+				e.mu.Unlock()
+				return err
+			}
+			e.mu.Unlock()
+		case <-forceCh:
+			e.forceDrainClosed = true
+			e.decide("forced drain: cancelling executor contexts of in-flight attempts")
+			e.execCancel()
 		case ev := <-e.events:
 			// Shutdown is treated exactly like a crash: when ctx and an event
 			// race, prefer the shutdown interpretation once ctx is done. No
@@ -65,6 +95,11 @@ func (e *Engine) runLoop(ctx context.Context) error {
 			}
 			// Any event may have unblocked multiple tasks.
 			e.scheduleAll("post-event scheduling")
+			if e.draining && e.drainComplete() {
+				err := e.finishDrain()
+				e.mu.Unlock()
+				return err
+			}
 			e.mu.Unlock()
 		}
 	}
@@ -110,6 +145,8 @@ func (e *Engine) scheduleRetryWait(id string, st *TaskState) {
 	if e.clock.Now().Before(st.NextRunAt) {
 		return
 	}
+	e.decide("task=%q retry deadline %s already elapsed at %s; eligible immediately",
+		id, st.NextRunAt.Format(time.RFC3339Nano), e.clock.Now().Format(time.RFC3339Nano))
 	// Backoff elapsed. A dependency may have failed while we waited.
 	switch e.checkDeps(id) {
 	case depsBlocked:
@@ -156,6 +193,14 @@ func (e *Engine) failTaskFromDeps(id string, st *TaskState) {
 func (e *Engine) startAttempt(id, reason string) {
 	st := e.snap.Tasks[id]
 	from := st.Status
+	if e.draining {
+		// Graceful shutdown in progress: nothing new is dispatched, not even a
+		// task whose backoff just elapsed or whose deps just succeeded. Its
+		// persisted status (pending / retry_wait with the ORIGINAL NextRunAt) is
+		// its stable home until the next start resumes it.
+		e.decide("task=%q NOT dispatched during drain (status=%s): %s", id, from, reason)
+		return
+	}
 	if !canTransition(from, StatusRunning) {
 		e.decide("task=%q NOT dispatched: illegal transition %s -> running (ignored)", id, from)
 		return
@@ -211,6 +256,14 @@ func (e *Engine) handleAttemptDone(ev event) {
 	used := n
 
 	switch {
+	case ev.forced:
+		// Forced graceful drain: the executor context was cancelled because the
+		// shutdown grace period expired. The executor's own verdict is not
+		// trusted (its side effects may or may not have happened); the attempt
+		// is closed as interrupted exactly like a crash, and gets the same
+		// retry/budget decision on the next start.
+		a.Class = AttemptInterrupted
+		a.Reason = "cancelled during forced graceful shutdown drain"
 	case ev.result == nil:
 		// Timeout fired on the engine side — a deterministic terminal-ish event.
 		a.Class = AttemptTimeout
@@ -238,6 +291,8 @@ func (e *Engine) handleAttemptDone(ev event) {
 		next, why = StatusFailed, "retry budget exhausted ("+strconv.Itoa(used)+"/"+strconv.Itoa(policy.MaxAttempts)+")"
 	case a.Class == AttemptTimeout:
 		next, why = StatusRetryWait, "attempt timed out; scheduling retry"
+	case a.Class == AttemptInterrupted:
+		next, why = StatusRetryWait, "attempt interrupted by forced drain; scheduling retry on next start"
 	case a.Class == AttemptFailed && !a.Retryable:
 		next, why = StatusFailed, "failure marked non-retryable by executor"
 	default:
@@ -261,11 +316,19 @@ func (e *Engine) handleAttemptDone(ev event) {
 		ev.taskID, ev.seq, a.Class, a.Reason, next)
 
 	if next == StatusRetryWait {
-		// Register the backoff timer synchronously, inside this scheduling
-		// decision, so its registration is part of the atomic "move to
-		// retry_wait" decision and cannot race with clock advancement. Only
-		// the WAIT on it happens on another goroutine.
-		e.armRetry(ev.taskID, st.NextRunAt)
+		if e.draining {
+			// The persisted NextRunAt is the stable home; the next start re-arms
+			// the original deadline. Do not register a timer the scheduler is
+			// about to stop observing.
+			e.decide("task %q parked in retry_wait until restart; deadline %s preserved (not reset)",
+				ev.taskID, st.NextRunAt.Format(time.RFC3339Nano))
+		} else {
+			// Register the backoff timer synchronously, inside this scheduling
+			// decision, so its registration is part of the atomic "move to
+			// retry_wait" decision and cannot race with clock advancement. Only
+			// the WAIT on it happens on another goroutine.
+			e.armRetry(ev.taskID, st.NextRunAt)
+		}
 	}
 	if next == StatusFailed || next == StatusSucceeded {
 		e.resolveWaiters(ev.taskID, nil)
@@ -303,6 +366,10 @@ func (e *Engine) armRetry(taskID string, t time.Time) {
 
 func (e *Engine) handleTrigger(ev event) {
 	st := e.snap.Tasks[ev.taskID]
+	if e.draining {
+		ev.reply <- ErrEngineNotRunning
+		return
+	}
 	if st.Status != StatusPending {
 		ev.reply <- &ErrTriggerIgnored{TaskID: ev.taskID}
 		return

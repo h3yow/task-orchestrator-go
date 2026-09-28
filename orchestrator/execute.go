@@ -15,8 +15,6 @@ import (
 //     delivered but the scheduler ignores it because the task's recorded
 //     attempt seq no longer matches.
 func (e *Engine) runAttempt(taskID string, seq int) {
-	defer func() { <-e.sem }()
-
 	def := e.defs[taskID]
 	// Derive from the engine's execution context so cancelling Run cancels
 	// every in-flight executor; the timeout gets its own independent cancel.
@@ -41,25 +39,52 @@ func (e *Engine) runAttempt(taskID string, seq int) {
 		resCh <- e.executor.Execute(ctx, taskID)
 	}()
 
+	var res *Result
+	forced := false
 	select {
 	case <-timeoutCh:
 		cancel()
 		e.decide("task=%q attempt #%d TIMED OUT after %s; cancelling executor context",
 			taskID, seq, def.Timeout)
-		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: nil})
 		// Wait for the (cancelled) executor goroutine to actually return so no
 		// user goroutine is leaked. Its late result is ignored by the scheduler
 		// via the attempt-seq check.
-		<-resCh
+		r := <-resCh
+		_ = r
+		res = nil
 	case r := <-resCh:
-		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: &r})
+		res = &r
+	case <-e.forceDrain:
+		// Graceful shutdown's grace period expired: cancel the attempt and wait
+		// for the executor to observe it before handing the decision back to the
+		// scheduler, which closes the attempt as "interrupted".
+		e.decide("task=%q attempt #%d cancelled by forced drain; waiting for executor to return",
+			taskID, seq)
+		cancel()
+		r := <-resCh
+		_ = r
+		forced = true
 	}
+
+	// Release the worker slot BEFORE delivering the result event: the scheduler
+	// treats an empty semaphore as "every in-flight task has been reconciled"
+	// during a drain, so it must never observe the slot held after the event.
+	<-e.sem
+	e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: res, forced: forced})
 }
 
 func (e *Engine) deliver(ev event) {
 	if e.execCtx == nil {
 		// Run never started (defensive; events should not exist then).
 		return
+	}
+	// Non-blocking first: the event channel is buffered and the scheduler is
+	// the only reader, so under normal operation this always succeeds and we
+	// never race the scheduler's select against a shutdown/force channel.
+	select {
+	case e.events <- ev:
+		return
+	default:
 	}
 	select {
 	case e.events <- ev:

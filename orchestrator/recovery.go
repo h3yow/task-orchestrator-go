@@ -61,6 +61,43 @@ func (e *Engine) recover() error {
 	return nil
 }
 
+// armPersistedRetryWaits (re)arms the backoff timer for every task that is
+// already in retry_wait when the scheduler starts:
+//
+//   - tasks that arrived here via recover() have NextRunAt=start time and are
+//     already eligible (the first scheduling pass dispatches them; no timer is
+//     needed for a due task),
+//   - tasks that were parked in retry_wait when the process stopped keep the
+//     ORIGINAL NextRunAt that was persisted. A restart must neither restart the
+//     wait nor strand the task: if the deadline already passed it is dispatched
+//     immediately by the scheduling pass; if it is still in the future the
+//     original deadline is re-armed here, so the total wait is never extended by
+//     repeated restarts.
+//
+// Called once at scheduler start, on the scheduler goroutine.
+func (e *Engine) armPersistedRetryWaits() {
+	rearmed := 0
+	for _, id := range e.order {
+		st := e.snap.Tasks[id]
+		if st.Status != StatusRetryWait {
+			continue
+		}
+		if !e.clock.Now().Before(st.NextRunAt) {
+			// Already due: the initial scheduling pass logs the decision and
+			// dispatches (or, during a drain, leaves the task eligible).
+			continue
+		}
+		remaining := st.NextRunAt.Sub(e.clock.Now())
+		e.decide("restart: task=%q still within persisted retry wait; re-arming original deadline %s (%s remaining, wait is not reset)",
+			id, st.NextRunAt.Format(time.RFC3339Nano), remaining)
+		e.armRetry(id, st.NextRunAt)
+		rearmed++
+	}
+	if rearmed == 0 {
+		e.decide("restart: no pending retry waits need re-arming")
+	}
+}
+
 // persist validates the current snapshot, advances its version atomically and
 // commits it. It must be called on the scheduler goroutine (or before Run).
 func (e *Engine) persist(why string) error {

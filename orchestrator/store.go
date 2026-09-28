@@ -155,7 +155,14 @@ func (s *MemoryStore) Commit(snap *Snapshot) error {
 }
 
 func cloneSnapshot(s *Snapshot) *Snapshot {
-	c := &Snapshot{Version: s.Version, Tasks: make(map[string]*TaskState, len(s.Tasks))}
+	c := &Snapshot{
+		Version:  s.Version,
+		Tasks:    make(map[string]*TaskState, len(s.Tasks)),
+		PlanHash: s.PlanHash,
+	}
+	if s.Plan != nil {
+		c.Plan = append([]TaskDef(nil), s.Plan...)
+	}
 	for id, st := range s.Tasks {
 		cp := *st
 		if st.Attempts != nil {
