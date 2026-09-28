@@ -37,6 +37,8 @@ const (
 	evAttemptDone eventKind = iota
 	evRetryDue
 	evTrigger
+	evShutdown
+	evWorkerExit
 )
 
 type event struct {
@@ -46,6 +48,15 @@ type event struct {
 	seq    int
 	at     time.Time // evRetryDue
 	reply  chan error
+	// epoch tags timer-born events (retry due, attempt timeout delivery) with
+	// the Run generation that armed the timer. A timer goroutine that outlives
+	// its Run (e.g. an engine abandoned to simulate a hard crash) must not
+	// deliver into a later engine/generation: such stale events are dropped.
+	// retryGen is the per-task backoff generation carried by evRetryDue, so a
+	// timer event that arrives late (after the task already entered a newer
+	// wait cycle or got dispatched) cannot spuriously dispatch it.
+	epoch    int
+	retryGen int
 }
 
 // Engine drives scheduling, retries, timeouts and restart recovery.
@@ -74,6 +85,10 @@ type Engine struct {
 	stop    chan struct{}
 	sem     chan struct{}
 
+	// shutdownCh is closed by the scheduler once a graceful shutdown has fully
+	// completed (Run is about to return). Shutdown callers block on it.
+	shutdownCh chan struct{}
+
 	runStarted atomic.Bool
 
 	// execCtx / execCancel control all in-flight executor attempts and are
@@ -85,6 +100,29 @@ type Engine struct {
 	// whose dependencies are satisfied; they are resolved when the task is
 	// dispatched or reaches a terminal state.
 	waiters map[string][]chan error
+
+	// retryArmed tracks the tasks whose retry timer is currently registered,
+	// so repeated scheduling passes never stack duplicate timers. It is only
+	// touched by the scheduler goroutine. Timers must be re-registered after a
+	// restart because the old ones died with the previous process; the awaited
+	// time itself comes from the persisted absolute NextRunAt, so a restart
+	// never restarts the wait clock.
+	retryArmed map[string]bool
+	// retryGens is the current backoff generation of each task's retry timer.
+	// It is bumped every time a fresh backoff timer is armed, so an evRetryDue
+	// from an older wait cycle is recognizably stale even within one Run.
+	retryGens map[string]int
+
+	// Shutdown bookkeeping; touched only by the scheduler goroutine except for
+	// shutdownRequested (set once via Shutdown before the event is enqueued).
+	shutdownRequested atomic.Bool
+	draining          bool
+	inFlight          int
+	shutdownReply     chan error
+
+	// epoch identifies the current Run generation; touched only by the
+	// scheduler goroutine. Timer goroutines armed during a Run carry its epoch.
+	epoch int
 }
 
 // New validates the DAG, loads persisted state (or initializes and commits
@@ -121,19 +159,27 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 		order = append(order, d.ID)
 	}
 
+	digest, err := planDigest(index, order)
+	if err != nil {
+		return nil, err
+	}
+
 	e := &Engine{
-		order:    order,
-		defs:     index,
-		store:    opt.Store,
-		executor: opt.Executor,
-		clock:    clock,
-		log:      opt.Logger,
-		maxConc:  maxConc,
-		events:   make(chan event, 256),
-		settled:  make(chan struct{}),
-		stop:     make(chan struct{}),
-		sem:      make(chan struct{}, maxConc),
-		waiters:  make(map[string][]chan error),
+		order:      order,
+		defs:       index,
+		store:      opt.Store,
+		executor:   opt.Executor,
+		clock:      clock,
+		log:        opt.Logger,
+		maxConc:    maxConc,
+		events:     make(chan event, 256),
+		settled:    make(chan struct{}),
+		stop:       make(chan struct{}),
+		sem:        make(chan struct{}, maxConc),
+		shutdownCh: make(chan struct{}),
+		waiters:    make(map[string][]chan error),
+		retryArmed: make(map[string]bool),
+		retryGens:  make(map[string]int),
 	}
 
 	loaded, err := opt.Store.Load()
@@ -144,7 +190,7 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 		// First ever start: every task is pending. Committing version 0 makes
 		// the initial state itself durable and auditable.
 		now := clock.Now()
-		snap := &Snapshot{Version: 0, Tasks: make(map[string]*TaskState, len(order))}
+		snap := &Snapshot{Version: 0, PlanDigest: digest, Tasks: make(map[string]*TaskState, len(order))}
 		for _, id := range order {
 			snap.Tasks[id] = newInitialState(now)
 		}
@@ -155,12 +201,19 @@ func New(defs []TaskDef, opt Options) (*Engine, error) {
 			return nil, err
 		}
 		loaded = snap
-		e.decide("initialized fresh state with %d pending tasks at version %d", len(order), loaded.Version)
+		e.decide("initialized fresh state with %d pending tasks at version %d (plan digest %s)",
+			len(order), loaded.Version, shortDigest(digest))
 	} else {
+		// Plan identity is checked before structural validation: a plan change
+		// and a corrupted/rolled-back snapshot must report different reasons.
+		if err := checkPlan(loaded, index, digest); err != nil {
+			return nil, err
+		}
 		if err := validateSnapshot(loaded, index); err != nil {
 			return nil, err
 		}
-		e.decide("loaded persisted state at version %d with %d tasks", loaded.Version, len(loaded.Tasks))
+		e.decide("loaded persisted state at version %d with %d tasks (plan digest %s matches)",
+			loaded.Version, len(loaded.Tasks), shortDigest(digest))
 	}
 	e.snap = loaded
 

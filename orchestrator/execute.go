@@ -14,9 +14,11 @@ import (
 //     closed as AttemptTimeout; a Result that comes back afterwards is
 //     delivered but the scheduler ignores it because the task's recorded
 //     attempt seq no longer matches.
-func (e *Engine) runAttempt(taskID string, seq int) {
-	defer func() { <-e.sem }()
-
+func (e *Engine) runAttempt(taskID string, seq, epoch int) {
+	// The concurrency slot is released explicitly (not via defer) BEFORE the
+	// worker-exit event is delivered, so the scheduler's subsequent scheduling
+	// pass can observe the freed slot and dispatch a task that was deferred for
+	// lack of concurrency.
 	def := e.defs[taskID]
 	// Derive from the engine's execution context so cancelling Run cancels
 	// every in-flight executor; the timeout gets its own independent cancel.
@@ -46,14 +48,20 @@ func (e *Engine) runAttempt(taskID string, seq int) {
 		cancel()
 		e.decide("task=%q attempt #%d TIMED OUT after %s; cancelling executor context",
 			taskID, seq, def.Timeout)
-		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: nil})
+		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: nil, epoch: epoch})
 		// Wait for the (cancelled) executor goroutine to actually return so no
 		// user goroutine is leaked. Its late result is ignored by the scheduler
 		// via the attempt-seq check.
 		<-resCh
 	case r := <-resCh:
-		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: &r})
+		e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: &r, epoch: epoch})
 	}
+
+	// Free the concurrency slot first, then tell the scheduler the worker is
+	// gone. The scheduler decrements inFlight from this event and, outside
+	// draining, runs a scheduling pass to fill the slot.
+	<-e.sem
+	e.deliver(event{kind: evWorkerExit, taskID: taskID, seq: seq, epoch: epoch})
 }
 
 func (e *Engine) deliver(ev event) {

@@ -19,6 +19,11 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	defer cancel()
 	defer close(e.stop)
 
+	// Begin a new timer generation. Any timer goroutine left over from an
+	// abandoned earlier Run carries a stale epoch and its event is dropped.
+	e.epoch++
+	epoch := e.epoch
+
 	e.decide("scheduler starting: %d tasks, max concurrent = %d", len(e.order), e.maxConc)
 
 	// Initial scheduling pass.
@@ -34,37 +39,93 @@ func (e *Engine) runLoop(ctx context.Context) error {
 			e.finishSettled()
 			s, f := e.terminalCounts()
 			e.decide("all tasks terminal: succeeded=%d failed=%d; scheduler stopping", s, f)
+			e.finishShutdown(nil)
 			return nil
 		}
 
-		ctxCh := ctx.Done()
+		// Watch both:
+		//   - ctx (Run's): the embedder cancelled the engine outright;
+		//   - execCtx: the Shutdown deadline fired (its watcher cancels it).
+		// Either way the engine exits crash-style: no further results commit;
+		// remaining open attempts get their deterministic home from recovery
+		// on the next start.
+		exit := func(err error) error {
+			if err == nil {
+				err = context.DeadlineExceeded
+			}
+			if err == context.DeadlineExceeded && ctx.Err() == nil {
+				e.decide("graceful shutdown deadline expired; cancelling %d in-flight attempt(s), exiting crash-style", e.inFlight)
+			} else {
+				e.decide("scheduler stopping: %v", err)
+			}
+			e.finishShutdown(err)
+			return err
+		}
 		select {
-		case <-ctxCh:
-			e.decide("scheduler cancelled by context: %v", ctx.Err())
-			return ctx.Err()
+		case <-ctx.Done():
+			return exit(ctx.Err())
+		case <-e.execCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return exit(err)
+			}
+			return exit(context.DeadlineExceeded)
 		case ev := <-e.events:
-			// Shutdown is treated exactly like a crash: when ctx and an event
-			// race, prefer the shutdown interpretation once ctx is done. No
-			// attempt result is committed; in-flight tasks stay "running" with
-			// an open attempt and get their deterministic home from recovery
-			// on the next start.
+			// If cancellation raced with event delivery, prefer the exit.
 			select {
-			case <-ctxCh:
-				e.decide("ignoring late event %d for task=%q during shutdown", ev.kind, ev.taskID)
-				return ctx.Err()
+			case <-ctx.Done():
+				return exit(ctx.Err())
+			case <-e.execCtx.Done():
+				if err := ctx.Err(); err != nil {
+					return exit(err)
+				}
+				return exit(context.DeadlineExceeded)
 			default:
 			}
+			// Drop timer/worker events left over from an earlier Run generation
+			// (their engine was abandoned, e.g. a simulated hard crash). Without
+			// this they would wake/dispatch the current generation's tasks on a
+			// schedule that is no longer theirs. Trigger events carry no epoch.
+			switch ev.kind {
+			case evRetryDue, evAttemptDone, evWorkerExit:
+				if ev.epoch != epoch {
+					e.decide("dropping stale event %d for task=%q (epoch %d != %d)", ev.kind, ev.taskID, ev.epoch, epoch)
+					continue
+				}
+			}
 			e.mu.Lock()
+			// scheduleAgain records whether this event actually changed
+			// scheduling-relevant state. A stale wake-up (e.g. a retry timer
+			// whose task already moved on) must NOT trigger a scheduling pass:
+			// otherwise the pass could dispatch a different retry_wait task a
+			// moment after it entered its fresh backoff window.
+			scheduleAgain := true
 			switch ev.kind {
 			case evAttemptDone:
 				e.handleAttemptDone(ev)
 			case evRetryDue:
-				e.handleRetryDue(ev)
+				scheduleAgain = e.handleRetryDue(ev)
 			case evTrigger:
 				e.handleTrigger(ev)
+			case evWorkerExit:
+				// A worker fully returned and already released its concurrency
+				// slot. Outside draining this must run a scheduling pass so a
+				// task deferred for lack of concurrency can fill the slot;
+				// during draining it only advances the in-flight drain count.
+				e.inFlight--
+			case evShutdown:
+				e.handleShutdown(ev)
+				scheduleAgain = false
 			}
-			// Any event may have unblocked multiple tasks.
-			e.scheduleAll("post-event scheduling")
+			if e.draining {
+				// During graceful shutdown no new work may be admitted.
+				if e.drainCheck() {
+					e.mu.Unlock()
+					return nil
+				}
+			} else if scheduleAgain {
+				// Any event may have unblocked multiple tasks.
+				e.scheduleAll("post-event scheduling")
+			}
 			e.mu.Unlock()
 		}
 	}
@@ -80,8 +141,11 @@ func (e *Engine) finishSettled() {
 
 // scheduleAll makes every currently-possible scheduling decision once, in a
 // fixed order, and explains each one. It runs entirely on the scheduler
-// goroutine.
+// goroutine. No dispatch happens while draining for graceful shutdown.
 func (e *Engine) scheduleAll(why string) {
+	if e.draining {
+		return
+	}
 	e.decide("scheduling pass (%s)", why)
 	for _, id := range e.order {
 		st := e.snap.Tasks[id]
@@ -107,10 +171,28 @@ func (e *Engine) schedulePending(id string, st *TaskState) {
 }
 
 func (e *Engine) scheduleRetryWait(id string, st *TaskState) {
-	if e.clock.Now().Before(st.NextRunAt) {
+	// A timer for the CURRENT wait cycle is still pending/armed. Only the
+	// event that timer produces (handleRetryDue) is allowed to decide whether
+	// the deadline has passed; letting an unrelated event's scheduling pass
+	// dispatch here would race an in-flight timer event and could fire a retry
+	// early or double-arm across wait cycles.
+	if e.retryArmed[id] {
 		return
 	}
-	// Backoff elapsed. A dependency may have failed while we waited.
+	now := e.clock.Now()
+	if now.Before(st.NextRunAt) {
+		// Still inside the persisted backoff window. The timer that was armed
+		// in the previous (dead) process is gone, so re-register one for the
+		// remaining time. The absolute NextRunAt is what persists, so the wait
+		// is never re-baselined by a restart.
+		e.decide("task=%q waiting for retry until %s (%s remaining); arming timer",
+			id, st.NextRunAt.Format(time.RFC3339Nano), st.NextRunAt.Sub(now))
+		e.armRetry(id, st.NextRunAt, false)
+		e.retryArmed[id] = true
+		return
+	}
+	// Backoff already elapsed (including time spent while the process was
+	// stopped). A dependency may have failed while we waited.
 	switch e.checkDeps(id) {
 	case depsBlocked:
 		e.failTaskFromDeps(id, st)
@@ -182,8 +264,10 @@ func (e *Engine) startAttempt(id, reason string) {
 	}
 	e.decide("DISPATCH task=%q attempt #%d: %s", id, seq, reason)
 	e.resolveWaiters(id, nil)
-
-	go e.runAttempt(id, seq)
+	// Count the worker before it starts so a shutdown event cannot observe
+	// inFlight=0 while the goroutine is already running.
+	e.inFlight++
+	go e.runAttempt(id, seq, e.epoch)
 }
 
 func (e *Engine) handleAttemptDone(ev event) {
@@ -265,43 +349,73 @@ func (e *Engine) handleAttemptDone(ev event) {
 		// decision, so its registration is part of the atomic "move to
 		// retry_wait" decision and cannot race with clock advancement. Only
 		// the WAIT on it happens on another goroutine.
-		e.armRetry(ev.taskID, st.NextRunAt)
+		e.armRetry(ev.taskID, st.NextRunAt, true)
+		e.retryArmed[ev.taskID] = true
 	}
 	if next == StatusFailed || next == StatusSucceeded {
 		e.resolveWaiters(ev.taskID, nil)
 	}
 }
 
-func (e *Engine) handleRetryDue(ev event) {
+// handleRetryDue consumes a retry-timer wake-up. It returns false (no
+// scheduling pass) when the event is stale: the timer belonged to a previous
+// wait cycle and the task has since been dispatched / moved on. Running a
+// scheduling pass on such a stale event could dispatch a task that just entered
+// a fresh backoff window.
+func (e *Engine) handleRetryDue(ev event) bool {
+	delete(e.retryArmed, ev.taskID)
+	// A timer from an older wait cycle (it arrived after the task had already
+	// moved on — e.g. the clock was advanced again before the event was
+	// processed) is stale; neither dispatch nor run a scheduling pass.
+	if ev.retryGen != e.retryGens[ev.taskID] {
+		e.decide("retry timer for task=%q ignored: stale backoff generation %d (current %d)",
+			ev.taskID, ev.retryGen, e.retryGens[ev.taskID])
+		return false
+	}
 	st := e.snap.Tasks[ev.taskID]
 	if st.Status != StatusRetryWait {
 		e.decide("retry timer for task=%q ignored: task is %s", ev.taskID, st.Status)
-		return
+		return false
 	}
 	e.decide("retry timer fired for task=%q (scheduled at %s)", ev.taskID, st.NextRunAt.Format(time.RFC3339Nano))
 	// The next scheduling pass will dispatch it; dependencies are rechecked.
+	return true
 }
 
 // armRetry registers the backoff timer synchronously (so registration is part
 // of the retry_wait decision and cannot race clock advancement) and waits for
-// it on a dedicated goroutine.
-func (e *Engine) armRetry(taskID string, t time.Time) {
+// it on a dedicated goroutine. When fresh is true a new wait cycle has begun
+// and the per-task backoff generation is bumped; when false the timer is being
+// re-registered after a restart for the SAME persisted wait cycle, so the
+// generation is kept. The event carries the generation, letting the scheduler
+// drop a timer event that arrives after its cycle was superseded.
+func (e *Engine) armRetry(taskID string, t time.Time, fresh bool) int {
 	now := e.clock.Now()
 	d := t.Sub(now)
 	if d < 0 {
 		d = 0
 	}
+	if fresh {
+		e.retryGens[taskID]++
+	}
+	rgen := e.retryGens[taskID]
 	ch := e.clock.After(d)
+	gen := e.epoch
 	go func() {
 		select {
 		case at := <-ch:
-			e.deliver(event{kind: evRetryDue, taskID: taskID, at: at})
+			e.deliver(event{kind: evRetryDue, taskID: taskID, at: at, epoch: gen, retryGen: rgen})
 		case <-e.stop:
 		}
 	}()
+	return rgen
 }
 
 func (e *Engine) handleTrigger(ev event) {
+	if e.draining {
+		ev.reply <- ErrShutdownInProgress
+		return
+	}
 	st := e.snap.Tasks[ev.taskID]
 	if st.Status != StatusPending {
 		ev.reply <- &ErrTriggerIgnored{TaskID: ev.taskID}

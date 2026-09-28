@@ -123,6 +123,11 @@ func (ts *TaskState) attemptCount() int { return len(ts.Attempts) }
 type Snapshot struct {
 	// Version is strictly incremented on every committed change; loaded
 	// snapshots with a non-monotonic version are rejected.
-	Version int                   `json:"version"`
-	Tasks   map[string]*TaskState `json:"tasks"`
+	Version int `json:"version"`
+	// PlanDigest is the SHA-256 fingerprint of the exact task plan this state
+	// belongs to (deps, timeout, retry policy). A restart resumes only when the
+	// supplied definitions digest to the same value. Snapshots written before
+	// this field existed are checked structurally instead.
+	PlanDigest string                `json:"plan_digest,omitempty"`
+	Tasks      map[string]*TaskState `json:"tasks"`
 }

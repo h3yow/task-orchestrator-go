@@ -12,6 +12,7 @@ const (
 	ReasonDuplicateID      ValidationReason = "duplicate_task_id"
 	ReasonInvalidTask      ValidationReason = "invalid_task"
 	ReasonInvalidState     ValidationReason = "invalid_persisted_state"
+	ReasonPlanChanged      ValidationReason = "plan_changed"
 	ReasonStoreUnavailable ValidationReason = "store_unavailable"
 )
 

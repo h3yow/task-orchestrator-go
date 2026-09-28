@@ -61,8 +61,11 @@ func (c *FakeClock) After(d time.Duration) <-chan time.Time {
 		ch <- c.now
 		return ch
 	}
-	// Drop already-fired timers so they can't be mistaken for pending ones.
-	kept := c.timers[:0]
+	// Prune already-fired timers. Allocate a fresh backing array rather than
+	// reusing c.timers' storage: otherwise a timer appended here could share a
+	// slot with a pruned entry whose channel send is still in flight, which
+	// made a just-registered timer look like the old (fired) one.
+	kept := make([]*fakeTimer, 0, len(c.timers)+1)
 	for _, t := range c.timers {
 		if !t.fired {
 			kept = append(kept, t)
@@ -84,8 +87,11 @@ func (c *FakeClock) Advance(d time.Duration) {
 	kept := make([]*fakeTimer, 0, len(c.timers))
 	for _, t := range c.timers {
 		if !t.fired && !t.fireAt.After(c.now) {
+			// Mark fired while holding the lock so a concurrent After cannot
+			// observe a due-but-unmarked timer and prune/keep it inconsistently.
+			t.fired = true
 			due = append(due, t)
-		} else {
+		} else if !t.fired {
 			kept = append(kept, t)
 		}
 	}
@@ -95,7 +101,6 @@ func (c *FakeClock) Advance(d time.Duration) {
 	// Fire outside the lock; channels are buffered so this never blocks.
 	sort.Slice(due, func(i, j int) bool { return due[i].fireAt.Before(due[j].fireAt) })
 	for _, t := range due {
-		t.fired = true
 		t.ch <- t.fireAt
 	}
 }

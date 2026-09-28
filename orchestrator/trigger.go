@@ -12,6 +12,9 @@ func (e *Engine) trigger(ctx context.Context, taskID string) error {
 	if !e.runStarted.Load() {
 		return ErrEngineNotRunning
 	}
+	if e.shutdownRequested.Load() {
+		return ErrShutdownInProgress
+	}
 
 	reply := make(chan error, 1)
 	ev := event{kind: evTrigger, taskID: taskID, reply: reply}
