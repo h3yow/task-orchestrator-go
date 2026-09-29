@@ -70,8 +70,21 @@ func (e *Engine) runLoop(ctx context.Context) error {
 			e.mu.Unlock()
 		case <-forceCh:
 			e.forceDrainClosed = true
+			// The grace deadline can win the race against consumption of the
+			// shutdown request: enter drain mode here as well so this event can
+			// never dispatch new work or end the drain while attempts are in
+			// flight.
+			e.beginDrain()
 			e.decide("forced drain: cancelling executor contexts of in-flight attempts")
 			e.execCancel()
+			e.mu.Lock()
+			e.scheduleAll("forced-drain scheduling (no new dispatches)")
+			if e.drainComplete() {
+				err := e.finishDrain()
+				e.mu.Unlock()
+				return err
+			}
+			e.mu.Unlock()
 		case ev := <-e.events:
 			// Shutdown is treated exactly like a crash: when ctx and an event
 			// race, prefer the shutdown interpretation once ctx is done. No
@@ -88,6 +101,11 @@ func (e *Engine) runLoop(ctx context.Context) error {
 			switch ev.kind {
 			case evAttemptDone:
 				e.handleAttemptDone(ev)
+				// Retire the attempt only NOW: the result has been reconciled and
+				// committed. Every dispatched attempt delivers exactly one
+				// evAttemptDone (stale or not), so both counters reach zero only
+				// after the last result has reached a durable home state.
+				e.releaseAttemptSlot(ev)
 			case evRetryDue:
 				e.handleRetryDue(ev)
 			case evTrigger:
@@ -225,10 +243,33 @@ func (e *Engine) startAttempt(id, reason string) {
 	if err := e.persist("task " + id + " transition " + string(from) + " -> running"); err != nil {
 		panic(err)
 	}
+	// Book the in-flight attempt only once its "running" state is durable; it is
+	// retired in the event handler after its result is reconciled and persisted.
+	e.inFlight++
 	e.decide("DISPATCH task=%q attempt #%d: %s", id, seq, reason)
 	e.resolveWaiters(id, nil)
 
 	go e.runAttempt(id, seq)
+}
+
+// releaseAttemptSlot retires one dispatched attempt on the scheduler
+// goroutine, after its evAttemptDone was handled. Runs while holding e.mu.
+// Every dispatched attempt produces exactly one done event, including stale
+// replies (a timeout already closed the attempt), so the counters balance
+// regardless of the verdict.
+func (e *Engine) releaseAttemptSlot(ev event) {
+	if e.inFlight > 0 {
+		e.inFlight--
+	} else {
+		e.decide("INTERNAL: attempt-done event for task=%q seq=%d retired without a booked slot",
+			ev.taskID, ev.seq)
+	}
+	select {
+	case <-e.sem:
+	default:
+		e.decide("INTERNAL: attempt-done event for task=%q seq=%d found the semaphore empty",
+			ev.taskID, ev.seq)
+	}
 }
 
 func (e *Engine) handleAttemptDone(ev event) {

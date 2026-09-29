@@ -78,6 +78,15 @@ type Engine struct {
 	stop    chan struct{}
 	sem     chan struct{}
 
+	// inFlight counts dispatched attempts whose result has not yet been
+	// reconciled by the scheduler. It is incremented in startAttempt and
+	// decremented only after the corresponding attempt-done event has been
+	// handled (state transition persisted) on the scheduler goroutine. The
+	// drain is complete iff inFlight == 0: unlike the semaphore fill level it
+	// cannot hit zero while a finished worker's result is still in flight
+	// towards the scheduler. Only touched on the scheduler goroutine.
+	inFlight int
+
 	// shutdown / drain state. closing shutdown requests a graceful drain
 	// (exactly once); closing forceDrain cancels the contexts of attempts that
 	// are still in flight when the shutdown grace period expires.
@@ -98,6 +107,11 @@ type Engine struct {
 	// whose dependencies are satisfied; they are resolved when the task is
 	// dispatched or reaches a terminal state.
 	waiters map[string][]chan error
+
+	// testHookBeforeDeliver, when non-nil, is invoked on the worker goroutine
+	// right before an attempt-done event is handed to the scheduler. It exists
+	// solely for deterministic tests of the worker/scheduler boundary.
+	testHookBeforeDeliver func(taskID string, seq int)
 }
 
 // New validates the DAG, loads persisted state (or initializes and commits

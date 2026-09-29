@@ -87,9 +87,11 @@ func TestRetrySucceedsOnThirdAttempt(t *testing.T) {
 	}
 	clock.Advance(11 * time.Millisecond)
 
-	// Timer event delivery is async; wait until attempt #2 has been recorded.
-	st = pollAttempts(t, e, "job", 2, 2*time.Second)
-	pollStatus(t, e, "job", StatusRetryWait, 2*time.Second)
+	// Timer event delivery is async; wait until attempt #2 has been recorded,
+	// then wait for that attempt to CLOSE into retry_wait before reading its
+	// record (the snapshot at attempts==2 may still be an open running attempt).
+	pollAttempts(t, e, "job", 2, 2*time.Second)
+	st = pollStatus(t, e, "job", StatusRetryWait, 2*time.Second)
 	if st.Attempts[1].Reason != "transient-2" {
 		t.Fatalf("attempt record wrong: %+v", st.Attempts)
 	}

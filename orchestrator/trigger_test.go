@@ -138,4 +138,9 @@ func TestTriggerParksUntilDepsSatisfied(t *testing.T) {
 	if exec.callCount("b") != 1 {
 		t.Fatalf("b ran %d times", exec.callCount("b"))
 	}
+	// Let the scheduler reach its own stopping point so its final decision log
+	// line cannot land after the test completed.
+	if err := e.Wait(2 * time.Second); err != nil {
+		t.Fatalf("engine did not settle: %v", err)
+	}
 }

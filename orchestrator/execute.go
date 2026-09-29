@@ -43,21 +43,29 @@ func (e *Engine) runAttempt(taskID string, seq int) {
 	forced := false
 	select {
 	case <-timeoutCh:
-		cancel()
-		e.decide("task=%q attempt #%d TIMED OUT after %s; cancelling executor context",
-			taskID, seq, def.Timeout)
-		// Wait for the (cancelled) executor goroutine to actually return so no
-		// user goroutine is leaked. Its late result is ignored by the scheduler
-		// via the attempt-seq check.
-		r := <-resCh
-		_ = r
-		res = nil
+		// A result racing the timeout may have arrived already; prefer it over a
+		// fabricated timeout when the executor actually finished in time.
+		select {
+		case r := <-resCh:
+			res = &r
+		default:
+			cancel()
+			e.decide("task=%q attempt #%d TIMED OUT after %s; cancelling executor context",
+				taskID, seq, def.Timeout)
+			// Wait for the (cancelled) executor goroutine to actually return so no
+			// user goroutine is leaked. Its late result is ignored by the scheduler
+			// via the attempt-seq check.
+			r := <-resCh
+			_ = r
+			res = nil
+		}
 	case r := <-resCh:
 		res = &r
 	case <-e.forceDrain:
-		// Graceful shutdown's grace period expired: cancel the attempt and wait
-		// for the executor to observe it before handing the decision back to the
-		// scheduler, which closes the attempt as "interrupted".
+		// Graceful shutdown's grace period expired: the deadline verdict wins.
+		// Even if the executor returns a Result a moment later (typically because
+		// the just-cancelled ctx unblocked it), that verdict is not trusted: the
+		// attempt is closed as "interrupted", exactly like a crash.
 		e.decide("task=%q attempt #%d cancelled by forced drain; waiting for executor to return",
 			taskID, seq)
 		cancel()
@@ -66,10 +74,14 @@ func (e *Engine) runAttempt(taskID string, seq int) {
 		forced = true
 	}
 
-	// Release the worker slot BEFORE delivering the result event: the scheduler
-	// treats an empty semaphore as "every in-flight task has been reconciled"
-	// during a drain, so it must never observe the slot held after the event.
-	<-e.sem
+	// The worker slot and the in-flight count are released on the SCHEDULER
+	// goroutine, after the result event has been handled and persisted. Releasing
+	// them here (before delivering the event) used to let a drain observe
+	// "nothing in flight" while one or more finished attempts had results still
+	// queued/unreconciled — the drain then returned with tasks stuck "running".
+	if hook := e.testHookBeforeDeliver; hook != nil {
+		hook(taskID, seq)
+	}
 	e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: res, forced: forced})
 }
 
@@ -86,9 +98,13 @@ func (e *Engine) deliver(ev event) {
 		return
 	default:
 	}
+	// Blocking handoff: wait for the scheduler or full shutdown. Do NOT race on
+	// execCtx.Done() — during a graceful forced drain the scheduler keeps
+	// consuming events while Run's context may already be done, and dropping the
+	// event here would strand an attempt in "running". runLoop always closes
+	// e.stop via defer, so this select can never block forever.
 	select {
 	case e.events <- ev:
-	case <-e.execCtx.Done():
 	case <-e.stop:
 	}
 }

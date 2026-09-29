@@ -2,8 +2,54 @@ package orchestrator
 
 import (
 	"context"
+	"strconv"
 	"time"
 )
+
+// DrainStats is a self-consistent summary of task states at the end of a
+// drain. InFlight is the number of attempts whose result has not yet been
+// reconciled into persisted state; after a completed graceful drain it is
+// always zero and Running is always zero.
+type DrainStats struct {
+	InFlight  int
+	Pending   int
+	Running   int
+	RetryWait int
+	Succeeded int
+	Failed    int
+	// SnapshotVersion is the version of the last state committed during drain.
+	SnapshotVersion int
+}
+
+// drainStats computes the current drain statistics on (or independently of)
+// the scheduler goroutine. The caller must hold e.mu.
+func (e *Engine) drainStatsLocked() DrainStats {
+	s := DrainStats{InFlight: e.inFlight, SnapshotVersion: e.snap.Version}
+	for _, st := range e.snap.Tasks {
+		switch st.Status {
+		case StatusPending:
+			s.Pending++
+		case StatusRunning:
+			s.Running++
+		case StatusRetryWait:
+			s.RetryWait++
+		case StatusSucceeded:
+			s.Succeeded++
+		case StatusFailed:
+			s.Failed++
+		}
+	}
+	return s
+}
+
+// DrainStats returns a snapshot of the current drain statistics. It is safe to
+// call concurrently. After a completed graceful drain InFlight and Running are
+// guaranteed zero and the per-state counts exactly match Snapshot().
+func (e *Engine) DrainStats() DrainStats {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.drainStatsLocked()
+}
 
 // Shutdown requests a graceful drain of the engine and blocks until the drain
 // is complete or ctx is done.
@@ -116,29 +162,40 @@ func (e *Engine) beginDrain() {
 	}
 }
 
-// drainComplete reports whether the drain has no more work: no attempt holds a
-// worker slot. All task-state reconciliation happens as attempt-done events are
-// processed; worker goroutines release their slot before delivering that event,
-// so a zero semaphore here means every in-flight task has reached a persisted
-// stable state.
-func (e *Engine) drainComplete() bool { return len(e.sem) == 0 }
-
-// finishDrain emits the final drain summary. The deferred close(stop) in
-// runLoop unblocks Shutdown afterwards.
-func (e *Engine) finishDrain() error {
-	pending, running, waiting := 0, 0, 0
+// drainComplete reports whether the drain has no more work: every dispatched
+// attempt has had its result reconciled AND persisted on the scheduler
+// goroutine (inFlight == 0), and no task is left in "running". The snapshot
+// check is defense in depth: a drain must never be reported complete while the
+// committed state still contains an ownerless running task.
+func (e *Engine) drainComplete() bool {
+	if e.inFlight != 0 {
+		return false
+	}
 	for _, st := range e.snap.Tasks {
-		switch st.Status {
-		case StatusPending:
-			pending++
-		case StatusRunning:
-			running++
-		case StatusRetryWait:
-			waiting++
+		if st.Status == StatusRunning {
+			return false
+		}
+	}
+	return true
+}
+
+// finishDrain verifies the post-drain invariant and emits the final summary.
+// The deferred close(stop) in runLoop unblocks Shutdown afterwards.
+func (e *Engine) finishDrain() error {
+	s := e.drainStatsLocked()
+	if s.InFlight != 0 || s.Running != 0 {
+		// Never finish a drain with unreconciled attempts or stranded running
+		// tasks: that is exactly the ambiguity graceful shutdown exists to
+		// remove.
+		return &ValidationError{
+			Reason: ReasonInvalidState,
+			Detail: "internal: refusing to finish drain with in-flight=" +
+				strconv.Itoa(s.InFlight) + " running=" + strconv.Itoa(s.Running) +
+				" tasks",
 		}
 	}
 	e.decide("graceful drain complete: no in-flight attempts remain; "+
-		"stable state at version %d (pending=%d retry_wait=%d running=%d)",
-		e.snap.Version, pending, waiting, running)
+		"stable state at version %d (succeeded=%d failed=%d pending=%d retry_wait=%d running=%d)",
+		s.SnapshotVersion, s.Succeeded, s.Failed, s.Pending, s.RetryWait, s.Running)
 	return ErrGracefulShutdown
 }

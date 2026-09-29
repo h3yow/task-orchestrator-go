@@ -17,7 +17,11 @@
   预算则立即重投，否则确定性失败）；已完成任务重启后绝不重复执行。
 - 优雅停机：`Shutdown` 后不再派发任何新任务（含重试），在途尝试要么跑完并
   正常提交，要么在宽限期结束后被取消并以 `interrupted` 关闭；停机前已排定
-  的待办（pending、retry_wait 的绝对重试时刻）原样保留并可续跑。
+  的待办（pending、retry_wait 的绝对重试时刻）原样保留并可续跑。**排空的
+  完成条件由调度器侧的在途计数判定**：只有每个已派发尝试的结果都已被调和
+  并 `Commit` 落盘后计数才归零，因此多个任务几乎同时结束（包括宽限期内自然
+  跑完与到期被强制取消）也不会提前收尾；停机返回后快照里不可能再出现
+  `running`。
 - 重试等待跨重启：等待窗口以**绝对时间点 `NextRunAt`** 落盘，重启后按原时刻
   重新挂表——已过点立即续跑，没到点继续等剩余时间，反复重启不会重新计时。
 - 计划一致性：快照带任务定义的 SHA-256 指纹；启动时定义（任务增删、依赖、
@@ -146,9 +150,25 @@ type Store interface {
 
 `Shutdown` 的细节：
 
+- **排空完成的判定（并发安全）**：引擎在调度器 goroutine 上维护一个在途
+  尝试计数（派发时 +1，对应 attempt-done 事件被处理、结果完成状态迁移并
+  `Commit` 后 -1）。计数在结果事件被调和**之前**绝不会下降——worker 先
+  释放并发槽再投递事件的窗口不再被视为"已排空"。因此当多个任务在停机
+  前后几乎同时跑完（无论自然跑完还是被宽限期到期取消）时，`Shutdown`
+  都会等到**最后一个**结果确定并落盘才返回；另外 `drainComplete` 还会
+  二次确认快照中没有任何 `running` 任务。
 - 返回前 drain 期间产生的每个状态都已 `Commit` 落盘，所以停机后的快照里
-  **不存在任何模糊状态**（不会留下"running 但进程已停"之外需要猜测的东西；
-  强制取消的尝试也已关闭并落盘）；`Run` 随后返回 `ErrGracefulShutdown`。
+  **不存在任何模糊状态**：每个任务要么 `succeeded`/`failed`（终止态），
+  要么停在明确的等待态 `pending`/`retry_wait`，绝不会留下"running 但进程
+  已停"这种没有归属的中间态（强制取消的尝试也已关闭并落盘）；`Run` 随后
+  返回 `ErrGracefulShutdown`。
+- 停机末尾的统计 `DrainStats()`（in-flight 及五种状态计数、快照版本）由
+  快照直接算出，与 `Snapshot()`/`State()` 严格一致：排空返回时
+  `InFlight == 0` 且 `Running == 0`，不可能出现"统计说没有在途、状态里
+  却有任务在跑"的矛盾。`finishDrain` 在内部会校验这一不变量，违反时
+  返回 `invalid_persisted_state` 错误而不是带着矛盾状态结束。
+- **没有任何在途任务时排空立即完成**（任务只是 pending 或停在 retry_wait），
+  `Shutdown` 立刻返回、版本号不前进。
 - 停机期间 `Trigger` 一律返回 `ErrEngineNotRunning`，已挂起的 Trigger 同样
   被唤醒并得到该错误，不会借停机窗口派发任务。
 - 停机前已经排定的事不会丢：尚未开始的任务保持 `pending`（其依赖关系还在
@@ -217,7 +237,11 @@ type Store interface {
   状态，下次启动仍由上述恢复规则决定归宿；尚未开始的任务保持 `pending`。
   需要"停机即交代清楚"时应使用 `Shutdown`（见上一节）。
 - 已 `succeeded` / `failed` 的任务在重启后原样保留，**永不重新执行**；
-  无运行中任务时恢复过程是无副作用的 no-op，版本号不前进。
+  只有结果确实没定下来的中断任务（崩溃留下的开放 `running` 尝试，或优雅
+  停机被强制取消记为 `interrupted` 的尝试）才按中断处理：有预算则重投、
+  预算耗尽则确定性失败。无运行中任务时恢复过程是无副作用的 no-op，版本号
+  不前进；停机时在宽限期内自然跑完并已落盘的成功/失败结果就是最终结果，
+  重启不会重跑。
 
 > 崩溃无法区分"执行器真的停了"与"执行器很慢但副作用已生效"，因此语义是
 > at-least-once：中断后可能再次执行，但引擎保证**只有一次尝试能提交成功**
@@ -239,6 +263,10 @@ type Store interface {
 ```bash
 # 全量单测（含 -race 竞态检测）
 go test ./... -race
+
+# 反复跑以确认并发停机场景的稳定性（所有时序由 FakeClock / 并发闸门控制，
+# 不做任何真实等待）
+go test ./orchestrator -race -run 'TestDrain|TestGraceful|TestShutdown|TestRecover|TestRetry' -count=30
 
 # 带调度决策日志的详细输出（测试日志打印每次调度与状态迁移依据）
 go test ./... -race -v
@@ -272,7 +300,12 @@ go run ./cmd/demo
 | 优雅停机宽限期到期：强制取消以 interrupted 落盘为 retry_wait，重启重放一次 | `TestGracefulShutdownForcesAfterDeadline` |
 | 强制停机耗尽最后预算 → 确定性失败 | `TestGracefulShutdownForceExhaustsBudget` |
 | 停机中 Trigger 被拒、挂起 Trigger 被释放 | `TestTriggersRejectedDuringDrain` |
-| Run 之前 Shutdown 为空操作 | `TestShutdownWhenNothingInFlight` |
+| Run 之前 Shutdown 为空操作 | `TestShutdownBeforeRunIsNoOp` |
+| 多任务并发、几乎同时完成时停机不提前收尾（并发闸门稳定复现旧竞态），停机后无 running、统计与状态一致、重启不重跑 | `TestDrainConcurrentTasksAllFinishNaturally` |
+| 多任务并发被宽限期到期强制取消：全部调和落盘后才返回，重启各重放一次 | `TestDrainConcurrentTasksForceCancelled` |
+| 多任务混合收尾：宽限期内自然完成与到期强制取消并存，结果都不丢不重 | `TestDrainMixedNaturalAndForcedFinish` |
+| 单个在途任务：宽限期内自然完成 / 到期强制取消 | `TestDrainSingleInFlightNaturalAndForced` |
+| 无在途任务（pending + retry_wait）停机立即完成、版本不前进、绝对重试时刻保留 | `TestDrainCompletesImmediatelyWhenNothingInFlight` |
 | 重试等待中停机、在原时刻之前重启继续等剩余时间、下游不丢 | `TestRetryWaitSurvivesRestartBeforeDeadline` |
 | 重启时退避已过点 → 立即续跑 | `TestRetryWaitElapsedBeforeRestartDispatchesImmediately` |
 | 连续两次重启不重新计时、总等待不被拉长 | `TestRepeatedRestartsDoNotResetRetryWait` |
@@ -298,7 +331,7 @@ orchestrator/
   state.go      状态机白名单与快照一致性校验
   store.go      Store 接口、FileStore（原子写）、MemoryStore
   recovery.go   重启时的 in-flight 调和、retry_wait 计时器重建
-  shutdown.go   Shutdown 优雅停机与 drain 状态统计
+  shutdown.go   Shutdown 优雅停机、调度器侧在途计数驱动的 drain 完成判定、DrainStats 统计
   engine.go     Engine、New 中的指纹写入/校验、读取 API
   runloop.go    单调度器事件循环、drain 闸门、全部状态迁移
   execute.go    单次尝试执行、超时、强制取消、依赖判定
