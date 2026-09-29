@@ -227,6 +227,7 @@ func (e *Engine) startAttempt(id, reason string) {
 	}
 	e.decide("DISPATCH task=%q attempt #%d: %s", id, seq, reason)
 	e.resolveWaiters(id, nil)
+	e.inFlight++
 
 	go e.runAttempt(id, seq)
 }
@@ -248,6 +249,12 @@ func (e *Engine) handleAttemptDone(ev event) {
 			}(), ev.seq)
 		return
 	}
+	// This is the reconciliation of exactly one dispatched attempt. The
+	// in-flight count may only drop once this function has classified the
+	// result, transitioned the task and persisted it below — never on entry
+	// (the worker releasing its semaphore slot is not the same event as the
+	// result being committed to state).
+	defer func() { e.inFlight-- }()
 
 	now := e.clock.Now()
 	a := &st.Attempts[n-1]

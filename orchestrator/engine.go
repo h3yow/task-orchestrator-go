@@ -78,6 +78,15 @@ type Engine struct {
 	stop    chan struct{}
 	sem     chan struct{}
 
+	// inFlight counts attempts dispatched by this scheduler whose result event
+	// has not yet been reconciled. It is mutated only on the scheduler
+	// goroutine: incremented in startAttempt, decremented in handleAttemptDone
+	// AFTER the matching reply commits the task's new state. Unlike len(sem)
+	// it cannot hit zero while result events are still queued in the buffered
+	// events channel, so drain completion means "every in-flight result is
+	// determined AND persisted", never merely "every worker slot is released".
+	inFlight int
+
 	// shutdown / drain state. closing shutdown requests a graceful drain
 	// (exactly once); closing forceDrain cancels the contexts of attempts that
 	// are still in flight when the shutdown grace period expires.

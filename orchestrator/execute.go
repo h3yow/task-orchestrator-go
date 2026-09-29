@@ -66,9 +66,11 @@ func (e *Engine) runAttempt(taskID string, seq int) {
 		forced = true
 	}
 
-	// Release the worker slot BEFORE delivering the result event: the scheduler
-	// treats an empty semaphore as "every in-flight task has been reconciled"
-	// during a drain, so it must never observe the slot held after the event.
+	// Release the worker slot before delivering the result event. The slot is
+	// only the concurrency limiter; drain completion is decided by the
+	// scheduler's in-flight counter, which is decremented only after this event
+	// is reconciled, so this ordering can never end a drain prematurely even
+	// when the event briefly sits in the buffered events channel.
 	<-e.sem
 	e.deliver(event{kind: evAttemptDone, taskID: taskID, seq: seq, result: res, forced: forced})
 }
@@ -86,9 +88,13 @@ func (e *Engine) deliver(ev event) {
 		return
 	default:
 	}
+	// Blocking fallback. Crucially we do NOT abandon the event on execCtx
+	// cancellation: a forced drain cancels execCtx while the scheduler is
+	// very much alive and waiting for exactly these attempt-done events, so
+	// dropping one would strand the in-flight counter and hang the drain. An
+	// event is only given up when the scheduler itself has stopped.
 	select {
 	case e.events <- ev:
-	case <-e.execCtx.Done():
 	case <-e.stop:
 	}
 }

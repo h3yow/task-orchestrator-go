@@ -147,8 +147,9 @@ type Store interface {
 `Shutdown` 的细节：
 
 - 返回前 drain 期间产生的每个状态都已 `Commit` 落盘，所以停机后的快照里
-  **不存在任何模糊状态**（不会留下"running 但进程已停"之外需要猜测的东西；
-  强制取消的尝试也已关闭并落盘）；`Run` 随后返回 `ErrGracefulShutdown`。
+  **不存在任何模糊状态**：没有任务停在 `running`，强制取消的尝试也已关闭并
+  落盘，每个任务都属于 `succeeded` / `failed` / `pending` / `retry_wait`
+  之一；`Run` 随后返回 `ErrGracefulShutdown`。
 - 停机期间 `Trigger` 一律返回 `ErrEngineNotRunning`，已挂起的 Trigger 同样
   被唤醒并得到该错误，不会借停机窗口派发任务。
 - 停机前已经排定的事不会丢：尚未开始的任务保持 `pending`（其依赖关系还在
@@ -157,6 +158,40 @@ type Store interface {
 - `Shutdown` 在 `Run` 之前调用是空操作；宽限期到期本身不会让 `Shutdown` 返回
   错误——它只触发强制取消，随后等待这些调和全部持久化（执行器应在 context
   取消后尽快返回）。
+
+### 并发场景下的排空完成条件
+
+多个在途任务在停机前后**几乎同时结束**是最容易出错的窗口：worker 协程在
+把"尝试结束"事件投递给调度器之前就已经释放了并发槽，而事件通道是带缓冲的——
+若排空完成与否只看"槽位是否全空"，就会在结果事件还排在缓冲区里、尚未写入
+状态时提前收尾，快照里留下一批滞留在 `running` 的任务。
+
+因此排空完成判据是调度器自己维护的**在途尝试计数（`inFlight`）**，而不是
+并发槽：
+
+- 每次派发尝试时计数 +1；
+- 只有当该尝试的结束事件被调度器取出、**结果被定级、任务状态迁移并
+  `Commit` 落盘之后**，计数才 -1；
+- `inFlight == 0` 是排空完成的唯一条件。它保证：**每一个在途尝试的结果都已
+  确定并写入状态**，无论该尝试是在宽限期内自然跑完，还是宽限期到期被强制
+  取消（强制取消以 `interrupted` 关闭，同样要走完定级与落盘才递减计数）；
+- 没有在途任务时（例如只有 `retry_wait` 与阻塞中的 `pending`），停机在进入
+  drain 后**立即**完成，不等待任何计时器。
+
+停机返回时调度器还会做一次自洽校验：快照中**不允许存在任何 `running`
+任务**，且在途计数必须为零，否则直接 panic（这只可能是引擎内部状态机
+缺陷，宁可显式崩溃也不把自相矛盾的快照交给重启）。收尾日志中的统计
+（`succeeded / failed / pending / retry_wait / running`，其中 `running`
+恒为 0）直接从最终快照汇总，与实际状态逐项对得上。
+
+停机后每个任务的状态只有以下四种明确归属，不存在没有归属的中间态：
+
+| 停机时的情形 | 停机后的状态 |
+| --- | --- |
+| 宽限期内自然跑完：成功 / 失败（预算耗尽或不可重试） / 可重试失败 | `succeeded` / `failed` / `retry_wait`（保留原绝对重试时刻） |
+| 宽限期到期被强制取消，预算未用尽 | `retry_wait`，尝试以 `interrupted` 关闭，重启立即可重试 |
+| 宽限期到期被强制取消，预算已用尽 | `failed`，终止原因即这次中断 |
+| 从未派发（含依赖在 drain 中才成功的下游） | `pending`，重启后照常调度 |
 
 ### 重试等待窗口跨重启的规则
 
@@ -249,7 +284,20 @@ gofmt -l .   # 无输出即合格
 
 # 端到端示例（含真实文件落盘与重启恢复）
 go run ./cmd/demo
+
+# 并发排空用例是竞态场景，建议高重复次数反复跑（全部应稳定通过）：
+go test ./orchestrator/ -race -count=50 -run 'TestConcurrentDrain|TestDrainCompletesImmediately|TestGracefulShutdown'
 ```
+
+并发停机相关测试不依赖真实等待来制造时序，而是用确定性的时序闸门：
+
+- `FakeClock`（`clock.go`）让重试退避 / 超时只在手动 `Advance` 时到期；
+- `gateBatchExecutor` 让每个任务在执行器内部阻塞在可单独关闭的 gate 上，
+  测试可以精确选择"让谁自然跑完、让谁被强制取消"；
+- `stallingStore` 包装 Store，在测试指定的时刻阻塞调度器的 `Commit`，从而
+  把"worker 已释放槽位、但结果事件还堆在事件通道里"这一窗口**稳定钉住**，
+  确保早收尾缺陷（以及修复）可 100% 复现，而不是靠多跑几次碰运气。
+
 
 测试覆盖的关键场景：
 
@@ -272,11 +320,17 @@ go run ./cmd/demo
 | 优雅停机宽限期到期：强制取消以 interrupted 落盘为 retry_wait，重启重放一次 | `TestGracefulShutdownForcesAfterDeadline` |
 | 强制停机耗尽最后预算 → 确定性失败 | `TestGracefulShutdownForceExhaustsBudget` |
 | 停机中 Trigger 被拒、挂起 Trigger 被释放 | `TestTriggersRejectedDuringDrain` |
-| Run 之前 Shutdown 为空操作 | `TestShutdownWhenNothingInFlight` |
+| Run 之前 Shutdown 为空操作 | `TestShutdownBeforeRunIsNoOp` |
 | 重试等待中停机、在原时刻之前重启继续等剩余时间、下游不丢 | `TestRetryWaitSurvivesRestartBeforeDeadline` |
 | 重启时退避已过点 → 立即续跑 | `TestRetryWaitElapsedBeforeRestartDispatchesImmediately` |
 | 连续两次重启不重新计时、总等待不被拉长 | `TestRepeatedRestartsDoNotResetRetryWait` |
 | drain 中在途尝试失败 → retry_wait 绝对时刻落盘并续跑 | `TestAttemptFailingDuringDrainCommitsRetryWait` |
+| 多任务并发、几乎同时在停机前后自然跑完：结果全部落盘后才排空、无 running 滞留、重启不重跑 | `TestConcurrentDrainNaturalFinishesNoRunningLeft` |
+| 多任务并发、宽限期到期同时被强制取消：全部 interrupted 调和、统计与状态一致、重启各重放一次 | `TestConcurrentDrainForcedCancelNoRunningLeft` |
+| 单个在途任务宽限期内自然完成、停机不早于结果落盘 | `TestConcurrentDrainSingleInFlightNaturalFinishes` |
+| 单个在途任务被宽限期到期强制取消、重启重放一次 | `TestConcurrentDrainSingleInFlightForced` |
+| 一次停机混合自然完成/强制取消/预算耗尽/未派发下游，各有明确归属且统计吻合 | `TestConcurrentDrainMixedEndings` |
+| 无在途任务（仅 retry_wait + blocked pending）停机立即排空，重启不重置退避 | `TestDrainCompletesImmediatelyWithNoInFlight` |
 | 任务增删 / 依赖 / 超时 / 重试策略变更被拒绝 | `TestRestartRejectsChangedPlan` |
 | 计划不一致与状态损坏错误类型可区分 | `TestPlanMismatchDistinctFromCorruptState` |
 | 声明顺序不同的等价计划正常续跑 | `TestSamePlanResumes` |

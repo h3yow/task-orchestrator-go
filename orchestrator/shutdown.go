@@ -116,17 +116,22 @@ func (e *Engine) beginDrain() {
 	}
 }
 
-// drainComplete reports whether the drain has no more work: no attempt holds a
-// worker slot. All task-state reconciliation happens as attempt-done events are
-// processed; worker goroutines release their slot before delivering that event,
-// so a zero semaphore here means every in-flight task has reached a persisted
-// stable state.
-func (e *Engine) drainComplete() bool { return len(e.sem) == 0 }
+// drainComplete reports whether the drain has no more work: every attempt
+// dispatched by this scheduler has had its result event reconciled and its new
+// state persisted. It is deliberately NOT derived from the concurrency
+// semaphore: a worker releases its semaphore slot before delivering the
+// attempt-done event, so with several attempts finishing at nearly the same
+// instant len(sem) can be zero while their result events are still queued in
+// the buffered events channel. inFlight, tracked on the scheduler goroutine,
+// only reaches zero after those events have each committed a task state — that
+// is what "drained" means.
+func (e *Engine) drainComplete() bool { return e.inFlight == 0 }
 
-// finishDrain emits the final drain summary. The deferred close(stop) in
-// runLoop unblocks Shutdown afterwards.
+// finishDrain emits the final drain summary and verifies the stopped state is
+// self-consistent. The deferred close(stop) in runLoop unblocks Shutdown
+// afterwards.
 func (e *Engine) finishDrain() error {
-	pending, running, waiting := 0, 0, 0
+	pending, running, waiting, succeeded, failed := 0, 0, 0, 0, 0
 	for _, st := range e.snap.Tasks {
 		switch st.Status {
 		case StatusPending:
@@ -135,10 +140,22 @@ func (e *Engine) finishDrain() error {
 			running++
 		case StatusRetryWait:
 			waiting++
+		case StatusSucceeded:
+			succeeded++
+		case StatusFailed:
+			failed++
 		}
 	}
-	e.decide("graceful drain complete: no in-flight attempts remain; "+
-		"stable state at version %d (pending=%d retry_wait=%d running=%d)",
-		e.snap.Version, pending, waiting, running)
+	if running != 0 || e.inFlight != 0 {
+		// Must be unreachable: drainComplete() is only true when every
+		// dispatched attempt has committed its terminal/waiting state. A
+		// mismatch here is an engine state-machine bug; failing loudly is far
+		// better than handing an inconsistent snapshot to a restart.
+		panic("orchestrator: internal drain invariant violated: " +
+			"in-flight attempts without a committed home")
+	}
+	e.decide("graceful drain complete: every in-flight attempt reconciled and persisted; "+
+		"stable state at version %d (succeeded=%d failed=%d pending=%d retry_wait=%d running=%d)",
+		e.snap.Version, succeeded, failed, pending, waiting, running)
 	return ErrGracefulShutdown
 }
